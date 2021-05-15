@@ -188,9 +188,13 @@ class Hiveworks : ParsedHttpSource() {
 
     override fun chapterListSelector() = "select[name=comic] option"
     override fun chapterListRequest(manga: SManga): Request {
-        val uri = Uri.parse(manga.url).buildUpon()
-            .appendPath("comic")
-            .appendPath("archive")
+        val uri = when {
+            "girlgeniusonline" in manga.url -> Uri.parse(manga.url).buildUpon()
+                .appendPath("comic.php")
+            else -> Uri.parse(manga.url).buildUpon()
+                .appendPath("comic")
+                .appendPath("archive")
+        }
         return GET(uri.toString(), headers)
     }
 
@@ -198,6 +202,7 @@ class Hiveworks : ParsedHttpSource() {
         val url = response.request.url.toString()
         when {
             "witchycomic" in url -> return witchyChapterListParse(response)
+            "girlgeniusonline" in url -> return girlGeniusChapterListParse(response)
         }
         val document = response.asJsoup()
         val baseUrl = document.select("div script").html().substringAfter("href='").substringBefore("'")
@@ -227,7 +232,12 @@ class Hiveworks : ParsedHttpSource() {
     override fun chapterFromElement(element: Element) = throw Exception("Not Used")
 
     // Pages
-
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return when {
+            "girlgeniusonline" in chapter.url -> girlGeniusFetchPageList(chapter)
+            else -> super.fetchPageList(chapter)
+        }
+    }
     override fun pageListRequest(chapter: SChapter) = GET(chapter.url, headers)
     override fun pageListParse(response: Response): List<Page> {
         val url = response.request.url.toString()
@@ -393,6 +403,63 @@ class Hiveworks : ParsedHttpSource() {
     )
 
     // Other Code
+    // Gets the chapter list for Girl Genius
+    private fun girlGeniusChapterListParse(response: Response): List<SChapter> {
+        // TODO: Better way to get this.
+        val baseUrl = response.request.url.scheme + "://" + response.request.url.toUri().authority
+        val document = response.asJsoup()
+        val elements = document.select("select[name=date] option")
+        if (elements.isNullOrEmpty()) throw Exception("This comic has a unsupported chapter list")
+        val chapters = mutableListOf<SChapter>()
+        // Crop off the "Jump to a Scene" pseudochapter
+        for (i in 1 until elements.size - 1) {
+            val chapter = SChapter.create()
+            val date = elements[i].attr("value")
+            chapter.name = elements[i].text()
+            chapter.url = baseUrl + "/comic.php?date=" + date
+            chapter.date_upload = SimpleDateFormat("yyyyMMdd", Locale.US).parse(date)?.time ?: 0
+            chapters.add(chapter)
+        }
+        // Remove duplicate items
+        chapters.distinctBy { it.url }
+        chapters.reverse()
+
+        return chapters
+    }
+
+    // Get page list for Girl Genius
+    private fun girlGeniusFetchPageList(chapter: SChapter): Observable<List<Page>> {
+        val firstPageUrl = chapter.url
+        val firstPageDate = firstPageUrl.substringAfter("?date=")
+        var document = client.newCall(GET(firstPageUrl, headers)).execute().asJsoup()
+
+        // Get the last page we should go to by parsing the chapter list.
+        val elements = document.select("select[name=date] option").distinctBy { it.attr("value") }
+        val idx = elements.indexOfFirst { it.attr("value") == firstPageDate }
+        val lastPageDate = elements.getOrNull(idx + 1)?.attr("value")
+
+        // Get all the pages by fetching each page sequentially...
+        val pages = mutableListOf<Page>()
+        while (true) {
+            document.select("div#comicbody > a > img")?.forEach {
+                pages.add(Page(pages.size, "", it.attr("src")))
+            }
+            val nextUrl = document.select("a#bottomnext")
+            if (nextUrl.isNotEmpty()) {
+                val nextImageUrl = nextUrl.attr("href")
+                val nextImageDate = nextImageUrl.substringAfter("?date=")
+                if (lastPageDate != null && nextImageDate >= lastPageDate) {
+                    break
+                }
+                document = client.newCall(GET(nextImageUrl, headers)).execute().asJsoup()
+            } else {
+                break
+            }
+        }
+
+        return Observable.just(pages)
+    }
+
     // Gets the chapter list for witchycomic
     private fun witchyChapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
